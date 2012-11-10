@@ -1,0 +1,11 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+$IPT -A INPUT -i $LOOP_IF -j ACCEPT
+$IPT -A OUTPUT -o $LOOP_IF -j ACCEPT
+
+# set policies to DROP all invalid packets
+$IPT -P INPUT DROP
+$IPT -P OUTPUT DROP
+$IPT -P FORWARD DROP

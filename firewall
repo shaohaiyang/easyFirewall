@@ -1,0 +1,296 @@
+#!/bin/sh
+#    You should have received a copy of the GNU General Public License
+#	 created by geminis <geminisshao@viatech.com.cn>
+### location of the rules
+INSTALL_PATH=/etc/firewall
+CONFIG=$INSTALL_PATH/config/config.inc
+QOS_SCRIPT=$INSTALL_PATH/config/qos.sh
+POLICY_SCRIPT=$INSTALL_PATH/config/policy.sh
+
+RULESDIR=$INSTALL_PATH/rules.d
+FIREWALL_PID=/var/run/firewall.pid
+POLICY_PID=/var/run/policy.pid
+QOS_PID=/var/run/qos.pid
+
+### check the command exist status
+test -x /sbin/iptables || exit 0
+set -e
+
+### include configs
+cp -af /config/.config/*.inc $INSTALL_PATH/config > /dev/null 2>&1 &
+cp -af /config/.config/*.sh $INSTALL_PATH/config >/dev/null 2>&1 &
+cp -af /config/.config/route_* $INSTALL_PATH/config >/dev/null 2>&1 &
+chmod 755  $INSTALL_PATH/config/*.sh
+
+### get dns server
+DNS=`grep nameserver /etc/resolv.conf |awk '{print $2}'|tr '\n' ' '`
+sed -r -i "/EXT_DNS=/s#.*#EXT_DNS=\"$DNS\"#" $CONFIG
+
+### get internat gateway
+DEVICE=`ifconfig |grep eth|awk '{print $1}'|tr '\n' ' '`
+DEF_DEV=`ip ro |grep default|uniq|sed -r 's:.*(eth.*)$:\1:g'`
+[ -s /etc/policy_start ] && DEF_DEV=`cat /etc/policy_start`
+
+STRING=""
+for dev in $DEVICE;do
+        NAME="$dev-WAN"
+        dev_IP=`grep IPADDR /etc/sysconfig/network-scripts/ifcfg-$dev|cut -d= -f2`
+        dev_MK=`grep NETMASK /etc/sysconfig/network-scripts/ifcfg-$dev|cut -d= -f2`
+        dev_GW=`grep GATEWAY /etc/sysconfig/network-scripts/ifcfg-$dev|cut -d= -f2`
+        [ $dev = $DEF_DEV ] && dev="*$dev"
+        STRING="$dev|$NAME|static|$dev_IP|$dev_MK|$dev_GW#1500 "$STRING
+done
+STRING=${STRING% }
+sed -r -i "/EXT_IF=/s@.*@EXT_IF=\"$STRING\"@" $CONFIG
+
+### 
+if [ -f $CONFIG ]; then
+	for RULES in $RULESDIR/[S]* ; do
+	sed -i "/.inc/d" $RULES
+	sed -i "2 a . $CONFIG" $RULES
+    	done
+else
+ echo -en $"\\033[1;31m"
+        echo	"##########################################################"
+	echo	"#  ! Warning: You must configure file first,do setup.sh. #"
+	echo	"##########################################################"
+ echo -en $"\\033[0;39m"
+        exit 0
+fi
+################################################################
+rules_clear(){
+# init
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+iptables -t nat -P OUTPUT ACCEPT
+iptables -t nat -P PREROUTING ACCEPT
+iptables -t nat -P POSTROUTING ACCEPT
+iptables -t mangle -P PREROUTING ACCEPT
+iptables -t mangle -P OUTPUT ACCEPT
+
+# flush tables
+iptables -F
+iptables -t nat -F
+iptables -t mangle -F
+
+#delete chains
+iptables -X
+iptables -t nat -X
+iptables -t mangle -X
+}
+################################################################
+env_init(){
+ echo -en $"\\033[33;1m"
+ echo "............Initialize firewall environment............"
+ echo -en $"\\033[0;39m"
+
+modprobe ip_conntrack
+sleep 1
+
+per_conntrack=$(dmesg |grep ip_conntrack|grep bytes|sed -r 's:.* (.*) bytes.*:\1:')
+freemem=`cat /proc/meminfo |grep MemFree|awk '{print $2}'`
+conntrack_max=`echo "$freemem*1024/$per_conntrack" |bc`
+time=0
+while [ "$conntrack_max" -ge "2" ];do
+        conntrack_max=`echo "$conntrack_max/2"|bc`
+        ((time+=1))
+done
+conntrack_max=`echo "2^($time)"|bc`
+#conntrack_buckets=`echo "$conntrack_max/4"|bc`
+echo "30" > /proc/sys/net/ipv4/netfilter/ip_conntrack_tcp_timeout_established
+
+### required proc configuration,modify by geminis
+ITEMS_DISABLE_0="accept_source_route accept_redirects send_redirects accept_redirects log_martians"
+ITEMS_DISABLE_1="rp_filter arp_filter proxy_arp secure_redirects arp_ignore"
+ITEMS_DISABLE_2="arp_announce"
+
+        for i in $ITEMS_DISABLE_0;do
+                for j in /proc/sys/net/ipv4/conf/*/$i;do
+                        echo "0">$j
+                done
+        done
+
+        for i in $ITEMS_DISABLE_1;do
+                for j in /proc/sys/net/ipv4/conf/*/$i;do
+                        echo "1">$j
+                done
+        done
+
+        for i in $ITEMS_DISABLE_2;do
+                for j in /proc/sys/net/ipv4/conf/*/$i;do
+                        echo "2">$j
+                done
+        done
+}
+################################################################
+policy_start(){
+        if [ -s $POLICY_SCRIPT ];then
+        echo -en $"\\033[33;1m"
+            sh $POLICY_SCRIPT start
+        echo -en $"\\033[0;39m"
+        fi
+}
+################################################################
+policy_stop(){
+        if [ -f $POLICY_PID ];then
+	# Setting default gateway
+		cat /var/log/default_interface|grep -q -i "dhcp"
+		if [ $? = 0 ];then 
+			DEV=$(sed -r 's/.*(eth.*)/\1/' /var/log/default_interface)
+			GW=$(netstat -nr|grep UG|grep $DEV|awk '{print $2}')
+			ip ro re default via $GW dev $DEV
+		else
+			ip ro re default via `cat "/var/log/default_interface"`
+		fi
+		ip ro fl ca
+	# Setting default gateway
+		cat /var/log/default_interface|grep -q -i "dhcp"
+		if [ $? = 0 ];then 
+			DEV=$(sed -r 's/.*(eth.*)/\1/' /var/log/default_interface)
+			GW=$(netstat -nr|grep UG|grep $DEV|awk '{print $2}')
+			ip ro re default via $GW dev $DEV
+		else
+			ip ro re default via `cat "/var/log/default_interface"`
+		fi
+		ip ro fl ca
+ 	echo -en $"\\033[1;31m"
+            sh $POLICY_SCRIPT stop
+ 	echo -en $"\\033[0;39m"
+        fi
+}
+################################################################
+qos_start(){
+	if [ -s $QOS_SCRIPT ];then
+ 	echo -en $"\\033[33;1m"
+	    echo "............Initialize QoS Traffic Control ............"
+	    sh $QOS_SCRIPT start
+	    touch $QOS_PID
+	fi
+ 	echo -en $"\\033[0;39m"
+}
+################################################################
+qos_stop(){
+        if [ -f $QOS_PID ];then
+ 	echo -en $"\\033[1;31m"
+	    echo "............Disable QoS Traffic Control ............"
+ 	echo -en $"\\033[0;39m"
+            sh $QOS_SCRIPT stop
+            rm -rf $QOS_PID
+        fi
+}
+################################################################
+start() {
+	env_init
+	qos_start
+	policy_start
+	echo 
+    echo -en $"\\033[32;1m"
+    echo "======================================================="
+    echo "			Start	firewall		"
+    echo "======================================================="
+    for RULES in $RULESDIR/[S]* ; do
+      	echo "`basename $RULES`		...................[ OK ]"
+	sh $RULES
+    done
+	touch $FIREWALL_PID
+    echo "done.The firewall is running !"
+    echo -en $"\\033[0;39m"
+}
+###################################################################
+stop() {
+ echo -en $"\\033[1;31m"
+    echo "======================================================="
+    echo "			Close firewall			"
+    echo "======================================================="
+    echo "0" > /proc/sys/net/ipv4/ip_forward
+    echo "0" > /proc/sys/net/ipv4/ip_dynaddr
+    # echo information about clear option
+    echo "iptables -F"
+    echo "iptables -t nat -F"
+    echo "iptables -t mangle -F"
+    echo "iptables -X"
+    echo "iptables -t nat -X"
+    echo "iptables -t mangle -X"
+    echo "iptables -P INPUT ACCEPT"
+    echo "iptables -P FORWARD DROP"
+    echo "iptables -P OUTPUT ACCEPT"
+    ###
+	rules_clear
+
+	if [ -f $FIREWALL_PID ];then
+		rm -rf $FIREWALL_PID
+	fi
+    sleep 1
+    echo "======================================================="
+    echo "done. Warning: firewall is close now! "
+	echo
+	policy_stop &
+	qos_stop &
+    echo -en $"\\033[0;39m"
+}
+###################################################################
+test() {
+ echo "Test firewall-rules: "
+    $0 start
+    echo "Rules now active for 10 seconds ..."
+    sleep 10
+    $0 stop
+    echo "Caution: rules now deactivated !"
+}
+###################################################################
+show() {
+	echo "Active firewall-rules: "
+	iptables -L $2
+}
+###################################################################
+restart() {
+	stop
+	sleep 2
+	start
+}
+###################################################################
+case "$1" in
+  start)
+        start
+        ;;
+  stop)
+        stop
+        ;;
+  restart)
+	restart
+	;;
+  pon)
+	policy_start
+	;;
+  poff)
+	policy_stop
+	;;
+  preload)
+	policy_stop
+	policy_start
+	;;
+  qon)
+	qos_start
+	;;
+  qoff)
+	qos_stop
+	;;
+  qreload)
+	qos_stop
+	qos_start
+	;;
+  test) 
+	test
+	;;
+  show)
+	show
+	;;
+  *)
+	echo -en $"\\033[33;1m"
+    	echo -n "Usage: /etc/init.d/firewall "
+ 	echo -en $"\\033[32;1m"
+	echo "{start|stop|restart|   pon|poff|preload|    qon|qoff|qreload|   test|show}"
+    	echo -en $"\\033[0;39m"
+    	exit 1
+esac

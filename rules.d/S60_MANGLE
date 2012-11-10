@@ -1,0 +1,158 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+## TOS stuff: (type: iptables -m tos -h)
+## Minimize-Delay 16 (0x10)
+## Maximize-Throughput 8 (0x08)
+## Maximize-Reliability 4 (0x04)
+## Minimize-Cost 2 (0x02)
+## Normal-Service 0 (0x00)
+
+$IPT -t mangle -A POSTROUTING -p TCP -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+$IPT -t mangle -A PREROUTING -p TCP -m tcp --tcp-flags SYN,RST,ACK SYN -j TOS --set-tos 16
+$IPT -t mangle -A PREROUTING -p TCP --syn -j TOS --set-tos 16
+
+if [ ! -z "$TOS_SET" ];then
+	for i in $TOS_SET;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                PROT=`echo $i|awk -F"|" '{print $1}'`
+                PORT=`echo $i|awk -F"|" '{print $2}'|sed 's/,/ /g'`
+                TOS=`echo $i|awk -F"|" '{print $3}'`
+                MARK=`echo $i|awk -F"|" '{print $4}'`
+		# modify for pppoe
+		[ -z $PPP_IF ] && PPP_IF="ppp0"
+
+		if [ -z $MARK ];then
+			OPT="-j TOS --set-tos $TOS"
+		else
+			OPT="-j MARK --set-mark $TOS"
+		fi
+
+		if [ $PROT = "all" ];then
+			for i in $PORT;do
+				$IPT -t mangle -A PREROUTING -p TCP --dport $i $OPT
+				$IPT -t mangle -A PREROUTING -p TCP --sport $i $OPT
+				$IPT -t mangle -A PREROUTING -p UDP --dport $i $OPT
+				$IPT -t mangle -A PREROUTING -p UDP --sport $i $OPT
+			done
+		else
+			for i in $PORT;do
+				$IPT -t mangle -A PREROUTING -p $PROT --dport $i $OPT
+				$IPT -t mangle -A PREROUTING -p $PROT --sport $i $OPT
+			done
+		fi
+	done
+fi
+
+if [ ! -z "$TOS_MARK" ];then
+	for i in $TOS_MARK;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+		TOS=`echo $i|awk -F"|" '{print $1}'`
+		MARK=`echo $i|awk -F"|" '{print $2}'`
+		$IPT -t mangle -A PREROUTING -m tos --tos $TOS -j MARK --set-mark $MARK
+	done	
+fi
+
+if [ ! -z "$DROP_URL" ];then
+	for i in $DROP_URL;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+		STRING=""
+		STR_TIME=""
+
+		TIME=`echo $i|awk -F"&" '{print $2}'`
+		i=`echo $i|awk -F"&" '{print $1}'`
+                i=`echo $i|tr 'A-Z' 'a-z'`
+		DIRECT=`echo $i|awk -F"|" '{print $1}'`
+		DEV=`echo $i|awk -F"|" '{print $2}'|sed 's/!/! /g'`
+
+		# modify for pppoe
+		[ -z $PPP_IF ] && PPP_IF="ppp0"
+                [ ! -z $DEV ] && [ $PPP_ENABLE = "YES" ] && [ $DEV = $PPP_DEV ] && DEV=$PPP_IF
+
+		URL=`echo $i|awk -F"|" '{print $3}'`
+		if [ $DIRECT = "in" ];then
+			DIRECT="PREROUTING -i $DEV "
+		elif [ $DIRECT = "out" ];then
+			DIRECT="POSTROUTING -o $DEV "
+		else
+			DIRECT="PREROUTING "
+		fi
+
+		echo $URL|grep -q "^p2p_"
+		if [ $? = 0 ];then
+		       	URL2=`echo $URL|sed "s/p2p_//g"|sed 's/#/ /g'`
+			STRING="-m ipp2p"
+			for j in $URL2;do
+				STRING="$STRING --$j"
+			done
+			
+                        if [ ! -z $TIME ] ;then
+                                TM_START=`echo $TIME|awk -F"|" '{print $1}'`
+                                TM_END=`echo $TIME|awk -F"|" '{print $2}'`
+                                TM_DAYS=`echo $TIME|awk -F"|" '{print $3}'`
+	                        [ -z $TM_DAYS ] && TM_DAYS="Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+                                STR_TIME=" -m time --timestart $TM_START --timestop $TM_END --days $TM_DAYS"
+                        fi
+                        $IPT -t mangle -A $DIRECT $STRING $STR_TIME -j DROP
+		else	
+			URL=`echo $URL|sed 's/#/ /g'`
+			for j in $URL;do
+                		echo $j|grep -q "^l7_"
+                		if [ $? = 0 ];then
+					URL2=`echo $j|sed "s/l7_//g"`		
+					STRING="-m layer7 --l7proto $URL2"
+				else 
+                			echo $URL|grep -q "mac_"
+			                if [ $? = 0 ];then
+                        			URL2=`echo $URL|sed "s/mac_//g"|sed 's/#/ /g'`
+			                        STRING="-m mac"
+                       				for j in $URL2;do
+			                                j="--mac-source $j"
+                       					STRING="$STRING $j "
+                        			done
+					DIRECT="FORWARD "
+					else
+						STRING="-m string --algo bm --string "$j""
+                			fi
+				fi
+
+			if [ ! -z $TIME ] ;then
+				TM_START=`echo $TIME|awk -F"|" '{print $1}'`
+				TM_END=`echo $TIME|awk -F"|" '{print $2}'`
+				TM_DAYS=`echo $TIME|awk -F"|" '{print $3}'`
+	                        [ -z $TM_DAYS ] && TM_DAYS="Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+				STR_TIME=" -m time --timestart $TM_START --timestop $TM_END --days $TM_DAYS"	
+			fi
+
+                        $IPT -t mangle -A $DIRECT $STRING $STR_TIME -j DROP
+			done
+		fi	
+	done
+fi
+
+
+
+if [ ! -z "$GOOD_URL" ];then
+	for i in $GOOD_URL;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+		STRING=""
+                STR=`echo $i|tr 'A-Z' 'a-z'`
+		URL=`echo $STR|sed 's/#/ /g'`
+		for j in $URL;do
+			STRING="-m string --algo bm --string "$j""
+                	$IPT -t mangle -I PREROUTING $STRING -j RETURN
+                	$IPT -t nat -I PREROUTING $STRING -j RETURN
+			$IPT -A wblist-chain $STRING -j ACCEPT
+		done
+	done
+fi

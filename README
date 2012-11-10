@@ -1,0 +1,46 @@
+PLF firewall (by geminis) a simply iptables framework
+Copyright 2002  geminis viatech<shaohaiyang@gmail.com>
+
+License
+=======
+
+Installation
+============
+You need a recent Linux 2.4 kernel with iptables activated (as module).
+
+untar the packet in /etc
+tar xzvf plffw-*.tar.gz -C /etc
+
+jump into the new dir
+cd /etc/firewall
+
+copy init-script into your init dir
+vi /etc/init.d/firewall
+/etc/firewall/firewall.sh start
+# chmod a+x firewall
+cd /etc/rc.d/rc3.d
+ln -s ../init.d/firewall ./S60firewall
+
+now you should first configure it bevor you link it into a auto-startup
+
+Configuration
+=============
+
+After that you could give take a first try with youir policy. Enter
+"/etc/init.d/firewall test"
+
+This will start the rules for 30 seconds, if everything is ok you can start
+it after that steady.
+"/etc/init.d/firewall start"
+
+To start the firewall also on system-boot put a link into the appropriate
+rc.d (eg. into /etc/rcS.d bevor the networking comes up)
+
+The tracker.pl script is nice alternative for "cat /proc/net/ip_conntrack"
+which shows the actual connection table.
+
+
+at last ,you could read the rule_d/sample ,need some help depond it 
+==========================================================================
+Have fun !
+

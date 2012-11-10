@@ -1,0 +1,25 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+$IPT -P INPUT ACCEPT
+$IPT -P FORWARD ACCEPT
+$IPT -P OUTPUT ACCEPT
+$IPT -t nat -P OUTPUT ACCEPT
+$IPT -t nat -P PREROUTING ACCEPT
+$IPT -t nat -P POSTROUTING ACCEPT
+$IPT -t mangle -P PREROUTING ACCEPT
+$IPT -t mangle -P OUTPUT ACCEPT
+
+# flush tables
+$IPT -F
+$IPT -t nat -F
+$IPT -t mangle -F
+$IPT -Z
+$IPT -t nat -Z
+$IPT -t mangle -Z
+
+#delete chains
+$IPT -X
+$IPT -t nat -X
+$IPT -t mangle -X

@@ -1,0 +1,298 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+if [ $FW_TYPE = "2" ];then
+
+	if [ ! -z "$FORWARD_SERVICES" ];then
+        for i in $FORWARD_SERVICES;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                STR_TIME=""
+                TIME=`echo $i|awk -F"&" '{print $2}'`
+
+		i=`echo $i|awk -F"&" '{print $1}'`
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                PROT=`echo $i|awk -F"|" '{print $1}'`
+                IN=`echo $i|awk -F"|" '{print $2}'|awk -F# '{print $1}'`
+		IN_ALIAS=`echo $IN|sed 's/:/-/'`
+
+                # modify for pppoe
+		[ -z $PPP_IF ] && PPP_IF="ppp0"
+                [ $PPP_ENABLE = "YES" ] && [ $IN = $PPP_DEV ] && IN=$PPP_IF
+
+                DPORT=`echo $i|awk -F"|" '{print $2}'|awk -F# '{print $2}'`
+
+                IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$IN_ALIAS"
+        	[ -s "$IF_CONF" ] || continue
+                egrep "BOOTPROTO=dhcp|BOOTPROTO=dialup" $IF_CONF 2>&1 > /dev/null
+                if [ $? = 0 ];then
+                	DADDR=$(ifconfig |grep $IN -A1|grep inet|awk '{print $2}'|awk -F: '{print $2}')
+                else
+                	DADDR=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                fi
+
+                SPORT=`echo $i|awk -F"|" '{print $3}'|awk -F# '{print $1}'`
+                SADDR=`echo $i|awk -F"|" '{print $3}'|awk -F# '{print $2}'`
+
+		
+		IN_DEV=`echo "$IN"|sed 's/:.*//'`
+                FORWARD_DEV=`echo $i|awk -F"|" '{print $3}'|awk -F# '{print $3}'`
+
+                if [ $PROT = "all" ];then
+			echo "$IN_DEV $SPORT" >> /tmp/tcp_conntrack
+			echo "$FORWARD_DEV $SPORT" >> /tmp/tcp_conntrack
+			echo "$IN_DEV $SPORT" >> /tmp/udp_conntrack
+			echo "$FORWARD_DEV $SPORT" >> /tmp/udp_conntrack
+			echo "$IN_DEV $SPORT" >> /tmp/tcp_remote
+			echo "$IN_DEV $SPORT" >> /tmp/udp_remote
+			echo "$SPORT" >> /tmp/tcp_local
+			echo "$SPORT" >> /tmp/udp_local
+                elif [ $PROT = "tcp" ];then
+			echo "$IN_DEV $SPORT" >> /tmp/tcp_conntrack
+			echo "$FORWARD_DEV $SPORT" >> /tmp/tcp_conntrack
+			echo "$IN_DEV $SPORT" >> /tmp/tcp_remote
+			echo "$SPORT" >> /tmp/tcp_local
+                else
+			echo "$IN_DEV $SPORT" >> /tmp/udp_conntrack
+			echo "$FORWARD_DEV $SPORT" >> /tmp/udp_conntrack
+			echo "$IN_DEV $SPORT" >> /tmp/udp_remote
+			echo "$SPORT" >> /tmp/udp_local
+                fi
+
+                EXTRA_IF=`echo $i|awk -F"|" '{print $4}'|tr '@' ' '`
+                EXTRA_IF="$FORWARD_DEV $EXTRA_IF"
+
+		IN_DEV=`echo $IN|awk -F: '{print $1}'`
+		echo "$IN_DEV#$FORWARD_DEV" >> /tmp/forward_card
+		for i in $EXTRA_IF;do
+			echo "$i#$FORWARD_DEV" >> /tmp/forward_card
+			echo "$i#$FORWARD_DEV" >> /tmp/snat_card
+		done
+
+                if [ ! -z $TIME ] ;then
+                        TM_START=`echo $TIME|awk -F"|" '{print $1}'`
+                        TM_END=`echo $TIME|awk -F"|" '{print $2}'`
+                        TM_DAYS=`echo $TIME|awk -F"|" '{print $3}'`
+			[ -z $TM_DAYS ] && TM_DAYS="Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+                        STR_TIME=" -m time --timestart $TM_START --timestop $TM_END --days $TM_DAYS"
+                fi
+		
+		IN=`echo $IN|awk -F: '{print $1}'`
+		echo "$SADDR#$DADDR#$IN" >> /tmp/masq_card
+		if [ $PROT = "all" ];then
+			$IPT -t nat -A PREROUTING -p TCP -i $IN -d $DADDR --dport $DPORT $STR_TIME -j DNAT --to $SADDR:$SPORT
+			$IPT -t nat -A PREROUTING -p UDP -i $IN -d $DADDR --dport $DPORT $STR_TIME -j DNAT --to $SADDR:$SPORT
+			if [ ! -z "$EXTRA_IF" ];then
+				for j in $EXTRA_IF;do
+					$IPT -t nat -A PREROUTING -p TCP -i $j -d $DADDR --dport $DPORT $STR_TIME -j DNAT --to $SADDR:$SPORT
+					$IPT -t nat -A PREROUTING -p UDP -i $j -d $DADDR --dport $DPORT $STR_TIME -j DNAT --to $SADDR:$SPORT
+				done
+			fi
+		else
+			$IPT -t nat -A PREROUTING -p $PROT -i $IN -d $DADDR --dport $DPORT $STR_TIME -j DNAT --to $SADDR:$SPORT
+			if [ ! -z "$EXTRA_IF" ];then
+				for j in $EXTRA_IF;do
+					$IPT -t nat -A PREROUTING -p $PROT -i $j -d $DADDR --dport $DPORT $STR_TIME -j DNAT --to $SADDR:$SPORT
+				done
+			fi
+		fi
+        done
+	fi
+
+for i in `cat /tmp/tcp_conntrack |sort|uniq|awk '{a[$1]=a[$1](a[$1]?",":"@")$2}END{for (i in a) print i a[i]}'`;do
+	DEV=`echo $i|awk -F@ '{print $1}'`
+	PORTS=`echo $i|awk -F@ '{print $2}'`
+	$IPT -I connect-track -p TCP -i "$DEV" -m multiport --dports "$PORTS" -m state --state NEW -j ACCEPT
+done
+
+for i in `cat /tmp/udp_conntrack |sort|uniq|awk '{a[$1]=a[$1](a[$1]?",":"@")$2}END{for (i in a) print i a[i]}'`;do
+	DEV=`echo $i|awk -F@ '{print $1}'`
+	PORTS=`echo $i|awk -F@ '{print $2}'`
+	$IPT -I connect-track -p UDP -i "$DEV" -m multiport --dports "$PORTS" -j ACCEPT
+done
+
+for i in `cat /tmp/tcp_remote |sort|uniq|awk '{a[$1]=a[$1](a[$1]?",":"@")$2}END{for (i in a) print i a[i]}'`;do
+	DEV=`echo $i|awk -F@ '{print $1}'`
+	PORTS=`echo $i|awk -F@ '{print $2}'`
+	$IPT -A remote-tcp-req -p TCP -i "$DEV" -m multiport --dports "$PORTS" -m state --state NEW -j ACCEPT
+done
+
+for i in `cat /tmp/udp_remote |sort|uniq|awk '{a[$1]=a[$1](a[$1]?",":"@")$2}END{for (i in a) print i a[i]}'`;do
+	DEV=`echo $i|awk -F@ '{print $1}'`
+	PORTS=`echo $i|awk -F@ '{print $2}'`
+	$IPT -A remote-tcp-req -p UDP -i "$DEV" -m multiport --dports "$PORTS" -j ACCEPT
+done
+
+PORTS=`cat /tmp/tcp_local |sort |uniq|tr '\n' ','`
+$IPT -A local-tcp-res -p TCP ! --syn -m multiport --sports ${PORTS%,} -j ACCEPT
+
+PORTS=`cat /tmp/udp_local |sort |uniq|tr '\n' ','`
+$IPT -A local-tcp-res -p UDP -m multiport --sports ${PORTS%,} -j ACCEPT
+
+#	if [ -s /tmp/masq_card ];then
+#	MASQ_LIST=`cat /tmp/masq_card|sort|uniq` 
+#	for i in  $MASQ_LIST;do
+#		SRC=`echo $i|awk -F# '{print $1}'`
+#		DST=`echo $i|awk -F# '{print $2}'`
+#		OUT=`echo $i|awk -F# '{print $3}'`
+#		$IPT -t nat -I POSTROUTING -s $SRC -o $OUT -j SNAT --to-source $DST
+#	done
+#	fi
+
+	if [ -s /tmp/forward_card ];then
+	FORWARD_LIST=`cat /tmp/forward_card|sort|uniq` 
+	for i in  $FORWARD_LIST;do
+		IN=`echo $i|awk -F# '{print $1}'`
+		OUT=`echo $i|awk -F# '{print $2}'`
+		if [ $IN = $OUT ] ;then
+			$IPT -A FORWARD -i $OUT -o $IN -j ACCEPT
+		else
+			$IPT -A FORWARD -i $OUT -o $IN -j ACCEPT
+			$IPT -A FORWARD -i $IN -o $OUT -j ACCEPT
+		fi
+	done
+	fi
+
+	if [ -s /tmp/snat_card ];then
+	SNAT_LIST=`cat /tmp/snat_card|sort|uniq` 
+        for i in  $SNAT_LIST;do
+                IN=`echo $i|awk -F# '{print $1}'`
+                OUT=`echo $i|awk -F# '{print $2}'`
+
+                IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$IN"
+                if [ -s $IF_CONF ];then
+                        IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                        MASK=$(grep "NETMASK" $IF_CONF|awk -F= '{print $2}')
+
+                        IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$OUT"
+		        if [ -s "$IF_CONF" ];then
+                        egrep "BOOTPROTO=dhcp|BOOTPROTO=dialup" $IF_CONF 2>&1 > /dev/null
+                        if [ $? = 0 ];then
+                                INT_IP=$(ifconfig |grep $OUT -A1|grep inet|awk '{print $2}'|awk -F: '{print $2}')
+                        else
+                                INT_IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                        fi
+                        $IPT -t nat -A POSTROUTING  -s $IP/$MASK -o $OUT -j SNAT --to $INT_IP
+			fi
+                fi
+	done
+	[ -s /tmp/snat_card ] && rm -rf /tmp/snat_card >/dev/null 2>&1
+	fi
+
+################################################################
+if [ ! -z "$WHITE_LIST" ];then
+        for i in $WHITE_LIST;do
+		prot=""
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+                dt=`echo $i|awk -F# '{print $1}'`
+                ip=`echo $i|awk -F# '{print $2}'`
+
+                echo $dt|grep -q -i "^[l7]"
+                if [ $? = 0 ] ;then
+                        prot="--l7proto $(echo $i|awk -F# '{print $2}')"
+                        dt=`echo $i|awk -F# '{print $3}'`
+                        ip=`echo $i|awk -F# '{print $4}'`
+                fi
+
+                echo $ip|grep -q ":"
+                if [ $? = 0 ] ;then
+                        $IPT -t nat -A PREROUTING -m mac --mac-source $ip -j RETURN
+                else
+                        echo $ip|grep -q "-"
+                        if [ $? = 0 ] ;then
+                                if [ $dt = "s" ];then
+                                        echo $prot|grep -q -i "l7"
+                                        if [ $? = 0 ] ;then
+                                                $IPT -t nat -A PREROUTING  -m iprange --src-range $ip -m layer7 $prot -j RETURN
+                                        else
+                                        	$IPT -t nat -A PREROUTING  -m iprange --src-range $ip -j RETURN
+                                        fi
+                                else
+                                        if [ $? = 0 ] ;then
+                                                $IPT -t nat -A PREROUTING -m iprange --src-range $ip -m layer7 $prot -j RETURN
+                                        else
+                                                $IPT -t nat -A PREROUTING -m iprange --dst-range $ip -j RETURN
+                                        fi
+                                fi
+                        else
+                                echo $prot|grep -q -i "l7"
+                                if [ $? = 0 ] ;then
+                                        $IPT -t nat -A PREROUTING -$dt $ip -m layer7 $prot -j RETURN
+                                else
+                                	$IPT -t nat -A PREROUTING -$dt $ip -j RETURN
+                                fi
+                        fi
+                fi
+        done
+fi
+
+ 	if [ ! -z $SQUID_PORT ];then 
+		if [ -z $SQUID_PROXY_AUTH ] || [ $SQUID_PROXY_AUTH != "YES" ];then
+			sed -i "/^http_port/s/^.*$/http_port $SQUID_PORT vhost vport=80/g"  $SQUID_CONF
+			sed -i "/^http_access allow authusers/d" $SQUID_CONF
+			sed -i -r "/^#http_access allow lan_/s/#(.*)/\1/p" $SQUID_CONF
+		else
+			sed -i "/^http_access allow lan_/s/^.*$/#&/" $SQUID_CONF
+			sed -i "/^http_access allow authusers/d" $SQUID_CONF
+			sed -i "/http_access allow lan_/a \http_access allow authusers" $SQUID_CONF
+			sed -i "/^http_port/s/^.*$/http_port $SQUID_PORT /g"  $SQUID_CONF
+		fi
+	fi
+
+	if [ $REDIRECT_ENABLE != "NO" ];then
+
+    	if [ ! -z "$REDIRECT_PORTS" ] && [ -s /var/run/squid.pid ];then
+        for i in $REDIRECT_PORTS;do
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                PROT="TCP"
+                IN=`echo $i|awk -F"|" '{print $1}'|awk -F# '{print $1}'`
+                OUT=`echo $i|awk -F"|" '{print $1}'|awk -F# '{print $2}'`
+
+                # modify for pppoe
+                [ -z $PPP_IF ] && PPP_IF="ppp0"
+                [ $PPP_ENABLE = "YES" ] && [ $OUT = $PPP_DEV ] && OUT=$PPP_IF
+
+                IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$IN"
+                if [ -s "$IF_CONF" ];then
+                        IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                        MASK=$(grep "NETMASK" $IF_CONF|awk -F= '{print $2}')
+
+                        SPORT="80"
+                        DPORT=$SQUID_PORT
+                        SADDR=`echo $i|awk -F"|" '{print $2}'|sed 's/!/! /g'`
+                        DADDR=`echo $i|awk -F"|" '{print $3}'|sed 's/!/! /g'`
+
+                        [ -z "$DADDR" ] && DADDR="0/0"
+
+                        STR_SADDR="-s $IP/$MASK"
+                        [ ! -z "$SADDR" ] && STR_SADDR="-s $SADDR"
+
+                        $IPT -t nat -A PREROUTING -i $IN $STR_SADDR -p $PROT -d $DADDR --dport $SPORT -j REDIRECT --to-ports $DPORT
+                fi
+        done
+   	fi
+	else
+    	[ ! -z $SQUID_PORT ] && sed -i "/^http_port/s/^.*$/http_port $SQUID_PORT/g"  $SQUID_CONF
+	fi
+[ -s /var/run/squid.pid ] && /etc/init.d/squid reload 2>&1 >/dev/null &
+fi
+
+###############################################################################################
+rm -rf  /tmp/tcp_conntrack \
+        /tmp/udp_conntrack \
+        /tmp/tcp_remote    \
+        /tmp/udp_remote    \
+        /tmp/udp_local     \
+        /tmp/tcp_local     \
+        /tmp/snat_card     \
+        /tmp/forward_card  \
+        /tmp/masq_card >/dev/null 2>&1
+
+$IPT -A local-tcp-req -j DROP
+$IPT -A remote-tcp-req -j DROP
+$IPT -A local-tcp-res -j DROP
+$IPT -A remote-tcp-res -j DROP
+###############################################################################################

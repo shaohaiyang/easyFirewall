@@ -1,0 +1,6 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+$IPT -A connect-track -j DROP
+

@@ -1,0 +1,168 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+LIST_LAN=""
+LIST_INT=""
+[ -z $PPP_IF ] && PPP_IF="ppp0"
+
+if [ ! -z "$LAN_IF" ];then
+        for i in $LAN_IF;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                DEV=`echo $i|awk -F"|" '{print $1}'`
+                LIST_LAN="$LIST_LAN $DEV"
+        done
+fi
+
+if [ ! -z "$EXT_IF" ];then
+        for i in $EXT_IF;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                DEV=`echo $i|awk -F"|" '{print $1}'|sed "s/*//g"`
+                [ $PPP_ENABLE = "YES" ] && [ $DEV = $PPP_DEV ] && DEV=$PPP_IF
+		(echo "$i"|grep -q :) || LIST_INT="$LIST_INT $DEV"
+        done
+fi
+
+[ $VPN_ENABLE = "PPTP" ] && $IPT -A OUTPUT -p GRE -j ACCEPT
+[ $VPN_ENABLE = "OPENVPN" ] && $IPT -A OUTPUT -p ICMP -o tun+ -j ACCEPT
+
+####################################################################################################
+if [ ! -z "$BLACK_LIST" ];then
+        for i in $BLACK_LIST;do
+		prot=""
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+                dt=`echo $i|awk -F# '{print $1}'`
+                ip=`echo $i|awk -F# '{print $2}'`
+
+                echo $dt|grep -q -i "^[l7]"
+                if [ $? = 0 ] ;then
+                        prot="--l7proto $(echo $i|awk -F# '{print $2}')"
+                        dt=`echo $i|awk -F# '{print $3}'`
+                        ip=`echo $i|awk -F# '{print $4}'`
+                fi
+
+                echo $ip|grep -q ":"
+                if [ $? = 0 ] ;then
+                        $IPT -A OUTPUT -m mac --mac-source $ip -j DROP
+                else
+                        echo $ip|grep -q "-"
+                        if [ $? = 0 ] ;then
+                                if [ $dt = "s" ];then
+                                        echo $prot|grep -q -i "l7"
+                                        if [ $? = 0 ] ;then
+                                                $IPT -A OUTPUT -m iprange --src-range $ip -m layer7 $prot -j DROP
+                                        else
+                                                $IPT -A OUTPUT -m iprange --src-range $ip -j DROP
+                                        fi
+                                else
+                                        if [ $? = 0 ] ;then
+                                                $IPT -A OUTPUT -m iprange --src-range $ip -m layer7 $prot -j DROP
+                                        else
+                                                $IPT -A OUTPUT -m iprange --dst-range $ip -j DROP
+                                        fi
+                                fi
+                        else
+                                echo $prot|grep -q -i "l7"
+                                if [ $? = 0 ] ;then
+                                        $IPT -A OUTPUT -$dt $ip -m layer7 $prot -j DROP
+                                else
+                                        $IPT -A OUTPUT -$dt $ip -j DROP
+                                fi
+                        fi
+                fi
+        done
+fi
+
+if [ ! -z "$WHITE_LIST" ];then
+        for i in $WHITE_LIST;do
+		prot=""
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+                dt=`echo $i|awk -F# '{print $1}'`
+                ip=`echo $i|awk -F# '{print $2}'`
+
+                echo $dt|grep -q -i "^[l7]"
+                if [ $? = 0 ] ;then
+                        prot="--l7proto $(echo $i|awk -F# '{print $2}')"
+                        dt=`echo $i|awk -F# '{print $3}'`
+                        ip=`echo $i|awk -F# '{print $4}'`
+                fi
+
+                echo $ip|grep -q ":"
+                if [ $? = 0 ] ;then
+                        $IPT -A OUTPUT -m mac --mac-source $ip -j ACCEPT
+                else
+                        echo $ip|grep -q "-"
+                        if [ $? = 0 ] ;then
+                                if [ $dt = "s" ];then
+                                        echo $prot|grep -q -i "l7"
+                                        if [ $? = 0 ] ;then
+                                                $IPT -A OUTPUT -m iprange --src-range $ip -m layer7 $prot -j ACCEPT
+                                        else
+                                                $IPT -A OUTPUT -m iprange --src-range $ip -j ACCEPT
+                                        fi
+                                else
+                                        if [ $? = 0 ] ;then
+                                                $IPT -A OUTPUT -m iprange --src-range $ip -m layer7 $prot -j ACCEPT
+                                        else
+                                                $IPT -A OUTPUT -m iprange --dst-range $ip -j ACCEPT
+                                        fi
+                                fi
+                        else
+                                echo $prot|grep -q -i "l7"
+                                if [ $? = 0 ] ;then
+                                        $IPT -A OUTPUT -$dt $ip -m layer7 $prot -j ACCEPT
+                                else
+                                        $IPT -A OUTPUT -$dt $ip -j ACCEPT
+                                fi
+                        fi
+                fi
+        done
+fi
+####################################################################################################
+$IPT -A OUTPUT -j dst-addr-check
+$IPT -A OUTPUT -p TCP --syn -m state --state NEW -j ACCEPT
+$IPT -A OUTPUT -p ! ICMP -j tcp-stat-flags
+$IPT -A OUTPUT -p ! ICMP -j connect-track
+
+if [ $REDIRECT_ENABLE != "NO" ] && [ -s /var/run/squid.pid ];then
+    if [ ! -z "$REDIRECT_PORTS" ];then
+        for i in $REDIRECT_PORTS;do
+                i=`echo $i|tr 'A-Z' 'a-z'`
+		PROT="TCP"
+                IN=`echo $i|awk -F"|" '{print $1}'|awk -F# '{print $1}'`
+                OUT=`echo $i|awk -F"|" '{print $1}'|awk -F# '{print $2}'`
+
+                # modify for pppoe
+                [ $PPP_ENABLE = "YES" ] && [ $OUT = $PPP_DEV ] && OUT=$PPP_IF
+
+                IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$IN"
+                IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                MASK=$(grep "NETMASK" $IF_CONF|awk -F= '{print $2}')
+
+
+                SPORT="80"
+                DPORT=$SQUID_PORT
+
+                $IPT -A OUTPUT -o $IN  -p $PROT -s $IP --sport $SPORT --dport $UNPRIVPORTS -m state --state ESTABLISHED,RELATED -j ACCEPT
+        done
+    fi
+fi
+
+for i in $LIST_LAN;do
+        $IPT -A OUTPUT -o $i -j EXT-output
+done
+
+for i in $LIST_INT;do
+        IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$i"
+        if [ -s "$IF_CONF" ];then
+                $IPT -A OUTPUT -o $i -j EXT-output
+        fi
+done

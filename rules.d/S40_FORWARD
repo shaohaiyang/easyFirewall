@@ -1,0 +1,179 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+if [ $FW_TYPE = "1" -o $FW_TYPE = "2" ];then
+
+$IPT -A FORWARD -j wblist-chain
+$IPT -A FORWARD -j forward-check
+
+# Syn-flood protection: 
+if [ ! -z "$EXT_IF" ];then
+        for i in $EXT_IF;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                DEV=`echo $i|awk -F"|" '{print $1}'|sed "s/*//g"`
+                [ $PPP_ENABLE = "YES" ] && [ $DEV = $PPP_DEV ] && DEV=$PPP_IF
+                (echo "$i"|grep -q :) || LIST_INT="$LIST_INT $DEV"
+        done
+fi
+
+for IF in $LIST_INT;do
+        $IPT -A FORWARD -i $IF -j syn-flood
+done
+
+$IPT -A FORWARD -j dst-addr-check
+$IPT -A FORWARD -p ! ICMP -j tcp-stat-flags
+$IPT -A FORWARD -p ! ICMP -j connect-track
+
+if [ $VPN_ENABLE = "PPTP" ];then
+	$IPT -A FORWARD -i $PPTP_DEV -o $VPN_IF -j ACCEPT
+	$IPT -A FORWARD -i $VPN_IF -o $PPTP_DEV -j ACCEPT
+fi
+
+if [ $VPN_ENABLE = "OPENVPN" ];then
+	$IPT -A FORWARD -p ALL -i tun+ -j ACCEPT
+	$IPT -A FORWARD -p ALL -o tun+ -j ACCEPT
+fi
+
+if [ "$FORWARD_RULE" = "LIMIT" ];then
+    if [ ! -z "$FORWARD_PORTS" ];then
+	for i in $FORWARD_PORTS;do
+		echo $i|grep -q "^[#]"
+		[ $? = 0 ] && continue
+
+                STR_TIME=""
+                TIME=`echo $i|awk -F"&" '{print $2}'`
+
+		i=`echo $i|awk -F"&" '{print $1}'`
+		i=`echo $i|tr 'A-Z' 'a-z'`
+
+		PROT=`echo $i|awk -F"|" '{print $1}'`
+		IN=`echo $i|awk -F"|" '{print $2}'|awk -F# '{print $1}'|awk -F: '{print $1}'`
+		OUT=`echo $i|awk -F"|" '{print $2}'|awk -F# '{print $2}'|awk -F: '{print $1}'`
+                SADD=`echo $i|awk -F"|" '{print $4}'|sed 's/!/! /g'`
+
+                # modify for pppoe
+		[ -z $PPP_IF ] && PPP_IF="ppp0"
+                [ $PPP_ENABLE = "YES" ] && [ $OUT = $PPP_DEV ] && OUT=$PPP_IF
+
+                if [ ! -z $TIME ] ;then
+                        TM_START=`echo $TIME|awk -F"|" '{print $1}'`
+                        TM_END=`echo $TIME|awk -F"|" '{print $2}'`
+                        TM_DAYS=`echo $TIME|awk -F"|" '{print $3}'`
+			[ -z $TM_DAYS ] && TM_DAYS="Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+                        STR_TIME=" -m time --timestart $TM_START --timestop $TM_END --days $TM_DAYS"
+                fi
+
+               	[ -z $PROT ] && PROT="all"
+               	[ -z "$SADD" ] && SADD="0/0"
+
+		# TCP / UDP /All protocol 
+
+		if [ $PROT = "tcp" -o $PROT = "udp" -o $PROT = "all" ] ;then
+			PORT=`echo $i|awk -F"|" '{print $3}'|awk -F# '{print $1}'`
+			ADDR=`echo $i|awk -F"|" '{print $3}'|awk -F# '{print $2}'`
+
+                	[ -z $PORT ] && PORT="all"
+                	[ -z $ADDR ] && ADDR="0/0"
+
+			if [ $PORT = "all" ];then
+				$IPT -A connect-track -i $IN -o $OUT -p $PROT -s $SADD -d $ADDR $STR_TIME -m state --state NEW -j ACCEPT
+				$IPT -A FORWARD -i $IN -o $OUT -p $PROT -s $SADD -d $ADDR $STR_TIME -j ACCEPT 
+				$IPT -A FORWARD -i $OUT -o $IN -p $PROT -s $ADDR -d $SADD $STR_TIME -j ACCEPT 
+			else
+				echo "$PORT"|grep -q ","
+				if [ $? = 0 ];then
+					if [ $PROT = "all" ];then
+					$IPT -A connect-track -i $IN -o $OUT -p TCP -s $SADD -d $ADDR -m multiport --dport $PORT $STR_TIME -m state --state NEW -j ACCEPT 
+					$IPT -A connect-track -i $IN -o $OUT -p UDP -s $SADD -d $ADDR -m multiport --dport $PORT $STR_TIME -m state --state NEW -j ACCEPT 
+					$IPT -A FORWARD -i $IN -o $OUT -p TCP -s $SADD -d $ADDR -m multiport --dport $PORT $STR_TIME -j ACCEPT 
+					$IPT -A FORWARD -i $IN -o $OUT -p UDP -s $SADD -d $ADDR -m multiport --dport $PORT $STR_TIME -j ACCEPT 
+					$IPT -A FORWARD -o $IN -i $OUT -p TCP -s $ADDR -d $SADD -m multiport --sport $PORT $STR_TIME -j ACCEPT 
+					$IPT -A FORWARD -o $IN -i $OUT -p UDP -s $ADDR -d $SADD -m multiport --sport $PORT $STR_TIME -j ACCEPT 
+					else
+					$IPT -A connect-track -i $IN -o $OUT -p $PROT -s $SADD -d $ADDR -m multiport --dport $PORT $STR_TIME -m state --state NEW -j ACCEPT 
+					$IPT -A FORWARD -i $IN -o $OUT -p $PROT -s $SADD -d $ADDR -m multiport --dport $PORT $STR_TIME -j ACCEPT 
+					$IPT -A FORWARD -o $IN -i $OUT -p $PROT -s $ADDR -d $SADD -m multiport --sport $PORT $STR_TIME -j ACCEPT 
+					fi
+				else
+					if [ $PROT = "all" ];then
+					$IPT -A connect-track -i $IN -o $OUT -p TCP -s $SADD -d $ADDR --dport $PORT $STR_TIME  -m state --state NEW -j ACCEPT 
+					$IPT -A FORWARD -i $IN -o $OUT -p TCP -s $SADD -d $ADDR --dport $PORT $STR_TIME -j ACCEPT 
+					$IPT -A FORWARD -i $IN -o $OUT -p UDP -s $SADD -d $ADDR --dport $PORT $STR_TIME -j ACCEPT 
+					$IPT -A FORWARD -o $IN -i $OUT -p TCP -s $ADDR -d $SADD --sport $PORT $STR_TIME -j ACCEPT 
+					$IPT -A FORWARD -o $IN -i $OUT -p UDP -s $ADDR -d $SADD --sport $PORT $STR_TIME -j ACCEPT 
+					else
+					$IPT -A connect-track -i $IN -o $OUT -p $PROT -s $SADD -d $ADDR --dport $PORT $STR_TIME  -m state --state NEW -j ACCEPT 
+					$IPT -A FORWARD -i $IN -o $OUT -p $PROT -s $SADD -d $ADDR --dport $PORT $STR_TIME -j ACCEPT 
+					$IPT -A FORWARD -o $IN -i $OUT -p $PROT -s $ADDR -d $SADD --sport $PORT $STR_TIME -j ACCEPT 
+					fi
+				fi
+			fi
+		### ICMP protocol
+		else
+			$IPT -A FORWARD -i $IN -o $OUT -s $SADD -p $PROT $STR_TIME -j ACCEPT 
+			$IPT -A FORWARD -o $IN -i $OUT -d $SADD -p $PROT $STR_TIME -j ACCEPT 
+		fi
+	done
+    else
+	echo "You should be firstly define FORWARD_PORTS rules !"
+    fi
+else
+	echo "$FORWARD_RULE"|grep -q -i "ALL"
+	if [ $? = 0 ];then
+        	STR_TIME=""
+        	TIME=`echo "$FORWARD_RULE"|awk -F"&" '{print $2}'`
+
+ 	        if [ ! -z "$TIME" ] ;then
+            		TM_START=`echo $TIME|awk -F"|" '{print $1}'`
+                	TM_END=`echo $TIME|awk -F"|" '{print $2}'`
+                	TM_DAYS=`echo $TIME|awk -F"|" '{print $3}'`
+			[ -z $TM_DAYS ] && TM_DAYS="Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+                	STR_TIME=" -m time --timestart $TM_START --timestop $TM_END --days $TM_DAYS"
+        	fi
+
+
+		if [ -z "$STR_TIME" ] ;then
+			$IPT -A FORWARD -j ACCEPT
+			$IPT -A connect-track -m state --state NEW -j ACCEPT
+		else
+			$IPT -A FORWARD $STR_TIME -j ACCEPT
+			$IPT -A connect-track $STR_TIME -m state --state NEW -j ACCEPT
+		fi
+	else
+		for ii in $FORWARD_RULE;do
+	                STR_TIME=""
+	                TIME=`echo $ii|awk -F"&" '{print $2}'`
+			ii=`echo $ii|awk -F"&" '{print $1}'`
+
+       		        if [ ! -z "$TIME" ] ;then
+                	        TM_START=`echo $TIME|awk -F"|" '{print $1}'`
+                       		TM_END=`echo $TIME|awk -F"|" '{print $2}'`
+	                        TM_DAYS=`echo $TIME|awk -F"|" '{print $3}'`
+				[ -z $TM_DAYS ] && TM_DAYS="Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+       		                STR_TIME=" -m time --timestart $TM_START --timestop $TM_END --days $TM_DAYS"
+                	fi
+
+			IN=`echo $ii|awk -F"|" '{print $1}'`
+			OUT=`echo $ii|awk -F"|" '{print $2}'`
+
+                	# modify for pppoe
+			[ -z $PPP_IF ] && PPP_IF="ppp0"
+                	[ $PPP_ENABLE = "YES" ] && [ $OUT = $PPP_DEV ] && OUT=$PPP_IF
+
+	                if [ -z "$STR_TIME" ] ;then
+ 				$IPT -A connect-track -i $IN -o $OUT -m state --state NEW -j ACCEPT
+				$IPT -A FORWARD -i $IN -o $OUT -j ACCEPT
+				$IPT -A FORWARD -i $OUT -o $IN -j ACCEPT
+               		else
+ 				$IPT -A connect-track -i $IN -o $OUT $STR_TIME -m state --state NEW -j ACCEPT
+				$IPT -A FORWARD -i $IN -o $OUT $STR_TIME -j ACCEPT
+				$IPT -A FORWARD -i $OUT -o $IN $STR_TIME -j ACCEPT
+                	fi
+		done
+	fi
+    fi
+fi

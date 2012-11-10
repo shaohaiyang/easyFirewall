@@ -1,0 +1,366 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+USER_CHAINS="EXT-input EXT-output forward-check \
+        src-addr-check  dst-addr-check \
+        tcp-stat-flags  connect-track \
+        local-dns-req   remote-dns-res \
+        local-tcp-req   remote-tcp-res \
+        remote-tcp-req  local-tcp-res \
+        local-udp-req   remote-udp-res \
+        icmp-in		icmp-out \
+	wblist-chain	syn-flood"
+
+for i in $USER_CHAINS;do
+        $IPT -N $i
+done
+
+# modify for pppoe
+[ $PPP_ENABLE = "YES" ] && echo "1" > /proc/sys/net/ipv4/ip_dynaddr
+
+### forward check chain allow redirect another gateway
+if [ ! -z "$SRV_FORWARD" ];then
+        for ip in $SRV_FORWARD;do
+                echo $ip|grep -q "^[#]"
+                [ $? = 0 ] && continue
+                dt=`echo $ip|awk -F# '{print $1}'`
+                ip=`echo $ip|awk -F# '{print $2}'`
+
+                echo $ip|grep -q ":"
+                if [ $? = 0 ] ;then
+                        $IPT -A forward-check -m mac --mac-source $ip -j ACCEPT
+                else
+                        $IPT -A forward-check -$dt $ip -j ACCEPT
+                fi
+        done
+fi
+
+### white chain allow somebody anything
+if [ ! -z "$BLACK_LIST" ];then
+        for i in $BLACK_LIST;do
+		prot=""
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+                dt=`echo $i|awk -F# '{print $1}'`
+                ip=`echo $i|awk -F# '{print $2}'`
+
+                echo $dt|grep -q -i "^[l7]"
+                if [ $? = 0 ] ;then
+                        prot="--l7proto $(echo $i|awk -F# '{print $2}')"
+                        dt=`echo $i|awk -F# '{print $3}'`
+                        ip=`echo $i|awk -F# '{print $4}'`
+                fi
+
+                echo $ip|grep -q ":"
+                if [ $? = 0 ] ;then
+                        $IPT -A wblist-chain -m mac --mac-source $ip -j DROP
+                else
+                        echo $ip|grep -q "-"
+                        if [ $? = 0 ] ;then
+                                if [ $dt = "s" ];then
+                                        echo $prot|grep -q -i "l7"
+                                        if [ $? = 0 ] ;then
+                                                $IPT -A wblist-chain -m iprange --src-range $ip -m layer7 $prot -j DROP
+                                        else
+                                                $IPT -A wblist-chain -m iprange --src-range $ip -j DROP
+                                        fi
+                                else
+                                        if [ $? = 0 ] ;then
+                                                $IPT -A wblist-chain -m iprange --src-range $ip -m layer7 $prot -j DROP
+                                        else
+                                                $IPT -A wblist-chain -m iprange --dst-range $ip -j DROP
+                                        fi
+                                fi
+                        else
+                                echo $prot|grep -q -i "l7"
+                                if [ $? = 0 ] ;then
+                                        $IPT -A wblist-chain -$dt $ip -m layer7 $prot -j DROP
+                                else
+                                        $IPT -A wblist-chain -$dt $ip -j DROP
+                                fi
+                        fi
+                fi
+        done
+fi
+
+if [ ! -z "$WHITE_LIST" ];then
+        for i in $WHITE_LIST;do
+		prot=""
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+                dt=`echo $i|awk -F# '{print $1}'`
+                ip=`echo $i|awk -F# '{print $2}'`
+
+                echo $dt|grep -q -i "^[l7]"
+                if [ $? = 0 ] ;then
+                        prot="--l7proto $(echo $i|awk -F# '{print $2}')"
+                        dt=`echo $i|awk -F# '{print $3}'`
+                        ip=`echo $i|awk -F# '{print $4}'`
+                fi
+
+                echo $ip|grep -q ":"
+                if [ $? = 0 ] ;then
+                        $IPT -A wblist-chain -m mac --mac-source $ip -j ACCEPT
+                else
+                        echo $ip|grep -q "-"
+                        if [ $? = 0 ] ;then
+                                if [ $dt = "s" ];then
+                                        echo $prot|grep -q -i "l7"
+                                        if [ $? = 0 ] ;then
+                                                $IPT -A wblist-chain -m iprange --src-range $ip -m layer7 $prot -j ACCEPT
+                                        else
+                                                $IPT -A wblist-chain -m iprange --src-range $ip -j ACCEPT
+                                        fi
+                                else
+                                        if [ $? = 0 ] ;then
+                                                $IPT -A wblist-chain -m iprange --src-range $ip -m layer7 $prot -j ACCEPT
+                                        else
+                                                $IPT -A wblist-chain -m iprange --dst-range $ip -j ACCEPT
+                                        fi
+                                fi
+                        else
+                                echo $prot|grep -q -i "l7"
+                                if [ $? = 0 ] ;then
+                                        $IPT -A wblist-chain -$dt $ip -m layer7 $prot -j ACCEPT
+                                else
+                                        $IPT -A wblist-chain -$dt $ip -j ACCEPT
+                                fi
+                        fi
+                fi
+        done
+fi
+
+######################################################
+if [ "$ANTI_DDOS" != "NO" -a ! -z "$SYN_ANTI_DDOS" ] ;then
+        for i in $SYN_ANTI_DDOS;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                PORT=`echo $i|awk -F@ '{print $1}'`
+                PROT=`echo $i|awk -F@ '{print $2}'`
+                RULE=`echo $i|awk -F@ '{print $3}'`
+
+                MARK=`echo $RULE|cut -c1-4`
+                case "$MARK" in
+                        conn)
+                                CONN=`echo $RULE|awk -F# '{print $2}'`
+                                [ ! -z "$PORT" ] && STRING="-m multiport --dports $PORT"
+                                $IPT -A syn-flood -p $PROT $STRING --syn -m connlimit --connlimit-above $CONN -j DROP
+                                ;;
+                        limi)
+                                LIMIT=`echo $RULE|awk -F# '{print $2}'`
+                                BURST=`echo $RULE|awk -F# '{print $3}'`
+                                [ ! -z "$PORT" ] && STRING="-m multiport --dports $PORT"
+                                $IPT -A syn-flood -p $PROT $STRING -m limit --limit $LIMIT --limit-burst $BURST -j ACCEPT
+                                ;;
+                        rece)
+                                TIME=`echo $RULE|awk -F# '{print $2}'`
+                                COUNT=`echo $RULE|awk -F# '{print $3}'`
+                                [ ! -z "$PORT" ] && STRING="-m multiport --dports $PORT"
+                                $IPT -A syn-flood -p $PROT $STRING -m recent --name Port$PORT-db --update --second $TIME --hitcount $COUNT -j DROP
+                                $IPT -A syn-flood -p $PROT $STRING -m recent --name Port$PORT-db --set
+                                ;;
+                esac
+        done
+fi
+### DNS Forwarding Name Server or client requests
+if [ ! -z $EXT_DNS_QUERY ] && [ $EXT_DNS_QUERY = "ALL" ];then
+	$IPT -A local-dns-req -p TCP -d 0/0 -m state --state NEW -j ACCEPT
+	$IPT -A local-dns-req -p UDP -d 0/0 -j ACCEPT
+	$IPT -A remote-dns-res -p TCP -m state --state ESTABLISHED,RELATED -s 0/0 --sport $DNS_PORT -j ACCEPT
+else
+	for i in $EXT_DNS;do
+        	$IPT -A local-dns-req -p TCP -d $i -m state --state NEW -j ACCEPT
+	        $IPT -A local-dns-req -p UDP -d $i -j ACCEPT
+		$IPT -A remote-dns-res -p TCP -m state --state ESTABLISHED,RELATED -s $i --sport $DNS_PORT -j ACCEPT
+	done
+fi
+$IPT -A local-dns-req -j DROP
+$IPT -A remote-dns-res -j DROP
+
+### BAD Source Address Check
+for i in $RESERVED_NET;do
+	echo $i|grep -q "^[#]"
+	[ $? = 0 ] && continue
+        $IPT -A src-addr-check -s $i -j DROP
+done
+
+### BAD Destination Address Check
+$IPT -A dst-addr-check -d $BROADCAST_DEST -j DROP
+$IPT -A dst-addr-check -p ! UDP -d 224.0.0.0/4 -j DROP
+for i in $PREVENT_NET;do
+	echo $i|grep -q "^[#]"
+	[ $? = 0 ] && continue
+        $IPT -A dst-addr-check -s $i -j DROP
+done
+
+### Spoof Attach Checking
+$IPT -A tcp-stat-flags -m state --state INVALID -j DROP
+$IPT -A tcp-stat-flags -p TCP ! --syn -m state --state NEW -j DROP
+$IPT -A tcp-stat-flags -p TCP --tcp-flags ALL FIN -j DROP ##
+$IPT -A tcp-stat-flags -p TCP --tcp-flags ALL ALL -j DROP ##
+$IPT -A tcp-stat-flags -p TCP --tcp-flags ALL NONE -j DROP
+$IPT -A tcp-stat-flags -p TCP --tcp-flags ACK,FIN FIN -j DROP
+$IPT -A tcp-stat-flags -p TCP --tcp-flags ACK,PSH PSH -j DROP
+$IPT -A tcp-stat-flags -p TCP --tcp-flags ACK,URG URG -j DROP
+$IPT -A tcp-stat-flags -p TCP --tcp-flags SYN,FIN SYN,FIN -j DROP
+$IPT -A tcp-stat-flags -p TCP --tcp-flags SYN,RST SYN,RST -j DROP
+$IPT -A tcp-stat-flags -p TCP --tcp-flags FIN,RST FIN,RST -j DROP
+$IPT -A tcp-stat-flags -p TCP --tcp-flags ALL FIN,URG,PSH -j DROP ##
+$IPT -A tcp-stat-flags -p TCP --tcp-flags ALL SYN,RST,ACK,FIN,URG -j DROP ##
+
+### Connection Tracking rules
+# Syn-flood protection: 
+$IPT -A connect-track -m state --state INVALID -j DROP
+$IPT -A connect-track -m state --state ESTABLISHED,RELATED -j ACCEPT
+$IPT -A connect-track -p UDP -m state --state NEW -j ACCEPT
+
+### Local UDP Rules
+$IPT -A local-udp-req -p UDP -m multiport --dport $NTP_PORT -j ACCEPT
+$IPT -A remote-udp-res -p UDP -m multiport --sport $NTP_PORT -j ACCEPT
+if [ $VPN_ENABLE = "OPENVPN" ];then
+        VIN=`echo $VPN_ROUTER|awk -F"|" '{print $1}'`
+	$IPT -A local-udp-req -p UDP -m multiport --sport $OPENVPN_PORT,137,138 -j ACCEPT
+	$IPT -A remote-udp-res -p UDP -i $VIN -m multiport --dport $OPENVPN_PORT,137,138 -j ACCEPT
+fi
+$IPT -A local-udp-req -j DROP
+$IPT -A remote-udp-res -j DROP
+
+### Local ICMP Rules
+### drop initial ICMP fragments
+$IPT -A icmp-in --fragment -j DROP
+$IPT -A icmp-out --fragment -j DROP
+
+### outgoing ping
+$IPT -A icmp-in -p ICMP --icmp-type destination-unreachable -j ACCEPT
+$IPT -A icmp-in -p ICMP --icmp-type parameter-problem -j ACCEPT
+$IPT -A icmp-in -p ICMP --icmp-type time-exceeded -j ACCEPT
+$IPT -A icmp-in -p ICMP --icmp-type echo-reply -j ACCEPT
+
+$IPT -A icmp-out -p ICMP --icmp-type echo-request -m state --state NEW -j ACCEPT
+$IPT -A icmp-out -p ICMP --icmp-type fragmentation-needed -j ACCEPT
+$IPT -A icmp-out -p ICMP --icmp-type parameter-problem -j ACCEPT
+$IPT -A icmp-out -p ICMP --icmp-type source-quench -j ACCEPT
+
+### outside ping
+if [ ! -z "$PING_HOST" ];then
+        for i in $PING_HOST;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                $IPT -A icmp-in -p ICMP -s $i --icmp-type echo-request -m state --state NEW -j ACCEPT
+                $IPT -A icmp-out -p ICMP -d $i --icmp-type echo-reply -j ACCEPT
+        done
+else
+                $IPT -A icmp-in -p ICMP --icmp-type echo-request -m state --state NEW -j DROP
+                $IPT -A icmp-out -p ICMP --icmp-type echo-reply -j DROP
+fi
+$IPT -A icmp-out -j DROP
+$IPT -A icmp-in -j DROP
+
+### Local TCP Client Request,Remote Server Response
+SSH_PORT=`sed -n /^Port/p $SSHD_CONF|awk '{print $2}'`
+[ -z $SSH_PORT ] && SSH_PORT="22"
+
+SRV_IN_PORTS="$SRV_IN_PORTS $WEBADMIN_PORT $SSH_PORT"
+
+if [ ! -z `pidof squid` ];then
+	if [ $SQUID_PROXY_AUTH = "YES" ] ;then
+		SRV_IN_PORTS=$SRV_IN_PORTS" $SQUID_PORT"
+	else
+		SRV_OUT_PORTS=$SRV_OUT_PORTS" 80"
+		SRV_IN_PORTS=$SRV_IN_PORTS" $SQUID_PORT 80"
+	fi
+fi
+
+[ $VPN_ENABLE = "PPTP" ] && SRV_IN_PORTS="$SRV_IN_PORTS $PPTP_PORT 445 139"
+VPN_NET=`echo $VPN_NET|sed 's/|/\//g'`
+[ $VPN_ENABLE = "OPENVPN" ] && SRV_IN_PORTS="$SRV_IN_PORTS $OPENVPN_PORT $SMB_PORT |$VPN_NET"
+
+PORTS=""
+if [ -z "$SRV_OUT_PORTS" ] ;then
+	$IPT -A local-tcp-req -p TCP --dport $UNPRIVPORTS -j ACCEPT
+	$IPT -A remote-tcp-res -p TCP ! --syn --sport $UNPRIVPORTS -j ACCEPT
+else
+for i in $SRV_OUT_PORTS;do
+       	echo $i|grep -q "^[#]"
+        [ $? = 0 ] && continue
+
+        ADDR=`echo $i|awk -F"|" '{print $2}'`
+
+        if [ -z $ADDR ];then
+                PORTS=$i","$PORTS
+        else
+        PO=`echo $i|awk -F"|" '{print $1}'`
+	if [ ! -z $PO ];then	
+        	$IPT -A local-tcp-req -p TCP -d "$ADDR" --dport "$PO" -m state --state NEW -j ACCEPT
+        	$IPT -A remote-tcp-res -p TCP ! --syn -s "$ADDR" --sport "$PO" -j ACCEPT
+	else
+        	$IPT -A local-tcp-req -p TCP -d "$ADDR" -m state --state NEW -j ACCEPT
+        	$IPT -A remote-tcp-res -p TCP ! --syn -s "$ADDR" -j ACCEPT
+	fi
+	fi
+done
+fi
+
+if [ ! -z "$PORTS" ];then
+PORTS=${PORTS%,}
+$IPT -A local-tcp-req -p TCP -m multiport --dport "$PORTS" -m state --state NEW -j ACCEPT
+$IPT -A remote-tcp-res -p TCP -m multiport --sport "$PORTS" ! --syn -j ACCEPT
+fi
+
+### Local TCP Server Response,Remote Server Request
+PORTS=""
+for i in $SRV_IN_PORTS;do
+       	echo $i|grep -q "^[#]"
+        [ $? = 0 ] && continue
+
+        ADDR=`echo $i|awk -F"|" '{print $2}'`
+        if [ -z $ADDR ];then
+                PORTS=$i","$PORTS
+        else
+        	PO=`echo $i|awk -F"|" '{print $1}'`
+		if [ ! -z $PO ];then
+	        	$IPT -A connect-track -p TCP -s "$ADDR" --dport "$PO" -m state --state NEW -j ACCEPT
+	        	$IPT -A remote-tcp-req -p TCP -s "$ADDR" --dport "$PO" -m state --state NEW -j ACCEPT
+			$IPT -A local-tcp-res -p TCP ! --syn -d "$ADDR" --sport "$PO" -j ACCEPT
+		else
+	        	$IPT -A connect-track -p TCP -s "$ADDR" -m state --state NEW -j ACCEPT
+	        	$IPT -A remote-tcp-req -p TCP -s "$ADDR" -m state --state NEW -j ACCEPT
+			$IPT -A local-tcp-res -p TCP ! --syn -d "$ADDR" -j ACCEPT
+		fi
+	fi
+done
+
+if [ ! -z "$PORTS" ];then
+	PORTS=${PORTS%,}
+	$IPT -A connect-track -p TCP -m multiport --dport "$PORTS" -m state --state NEW -j ACCEPT
+	$IPT -A remote-tcp-req -p TCP -m multiport --dport "$PORTS" -m state --state NEW -j ACCEPT
+	$IPT -A local-tcp-res -p TCP -m multiport --sport "$PORTS" ! --syn -j ACCEPT
+fi
+
+########################################
+$IPT -A EXT-input -p ICMP -j icmp-in
+$IPT -A EXT-output -p ICMP -j icmp-out
+
+### DNS Caching Name Server (query to remote,primary server)
+$IPT -A EXT-input -p UDP --sport $DNS_PORT --dport $DNS_PORT -j remote-dns-res
+$IPT -A EXT-input -p TCP ! --syn --sport $DNS_PORT --dport $UNPRIVPORTS -j remote-dns-res
+$IPT -A EXT-input -p UDP --sport $DNS_PORT --dport $UNPRIVPORTS -j remote-dns-res
+
+$IPT -A EXT-output -p UDP --sport $DNS_PORT --dport $DNS_PORT -j local-dns-req
+$IPT -A EXT-output -p TCP --sport $UNPRIVPORTS --dport $DNS_PORT -j local-dns-req
+$IPT -A EXT-output -p UDP --sport $UNPRIVPORTS --dport $DNS_PORT -j local-dns-req
+
+### Local UDP client, remote server
+$IPT -A EXT-input -p UDP --dport $UNPRIVPORTS -j remote-udp-res
+$IPT -A EXT-output -p UDP --sport $UNPRIVPORTS -j local-udp-req
+
+### Local TCP server, remote client
+$IPT -A EXT-input -p TCP --sport $UNPRIVPORTS -j remote-tcp-req
+$IPT -A EXT-output -p TCP ! --syn --dport $UNPRIVPORTS -j local-tcp-res
+
+### Local TCP client, remote server
+$IPT -A EXT-input -p TCP ! --syn --dport $UNPRIVPORTS -j remote-tcp-res
+$IPT -A EXT-output -p TCP --sport $UNPRIVPORTS -j local-tcp-req

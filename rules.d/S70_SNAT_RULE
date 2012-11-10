@@ -1,0 +1,196 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+if [ $FW_TYPE = "1" -o $FW_TYPE = "2" ];then
+
+if [ ! -z "$LAN_IF" ];then
+        for i in $LAN_IF;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                DEV=`echo $i|awk -F"|" '{print $1}'`
+                LIST_LAN="$LIST_LAN $DEV"
+        done
+fi
+
+if [ ! -z "$EXT_IF" ];then
+        for i in $EXT_IF;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                DEV=`echo $i|awk -F"|" '{print $1}'`
+		echo $DEV|grep "^*" 2>&1 >/dev/null
+		[ $? = 0 ] && DEFAULT_INT=`echo $DEV|sed "s/*//g"`
+        done
+fi
+
+[ -z $PPP_IF ] && PPP_IF="ppp0"
+[ $PPP_ENABLE = "YES" ] && [ $DEFAULT_INT = $PPP_DEV ] && DEFAULT_INT=$PPP_IF
+
+# add below route for tarffic control
+if [ $IPROUTER = "1" ] ;then
+        IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$DEFAULT_INT"
+	if [ -s "$IF_CONF" ];then
+        egrep "BOOTPROTO=dhcp|BOOTPROTO=dialup" $IF_CONF 2>&1 > /dev/null
+        if [ $? = 0 ];then
+                INT_IP=$(ifconfig |grep $DEFAULT_INT -A1|grep inet|awk '{print $2}'|awk -F: '{print $2}')
+        else
+                INT_IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+        fi
+	[ -f $POLICY_PID ] || /sbin/ip route replace default via $INT_IP
+	fi
+fi
+
+echo "$FORWARD_RULE"|grep -q -i "ALL"
+if [ $? = 0 ];then
+	IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$DEFAULT_INT"
+        if [ -s "$IF_CONF" ];then
+	egrep "BOOTPROTO=dhcp|BOOTPROTO=dialup" $IF_CONF 2>&1 > /dev/null
+	if [ $? = 0 ];then
+        	INT_IP=$(ifconfig |grep $DEFAULT_INT -A1|grep inet|awk '{print $2}'|awk -F: '{print $2}')
+	else
+        	INT_IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+	fi
+
+	for i in $LIST_LAN;do
+		IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$i"
+        	IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+		MASK=$(grep "NETMASK" $IF_CONF|awk -F= '{print $2}')
+		$IPT -t nat -A POSTROUTING  -s $IP/$MASK -o $DEFAULT_INT -j SNAT --to $INT_IP
+	done
+	fi
+else
+	if [ "$FORWARD_RULE" = "LIMIT" ];then
+		TMP="/tmp/interface.tmp"
+		[ -s $TMP ] && rm -rf $TMP
+		for i in $FORWARD_PORTS;do
+                        i=`echo $i|awk -F"&" '{print $1}'`
+			IF=`echo $i|awk -F"|" '{print $2}'`	
+			i=`echo $i|tr 'A-Z' 'a-z'`
+			echo $IF >> $TMP
+		done
+
+		if [ -s $TMP ];then 
+		REC=`cat $TMP |sort -u`
+		for i in $REC;do
+	        	IN=`echo $i|awk -F# '{print $1}'`
+	                OUT=`echo $i|awk -F# '{print $2}'|sed 's/:/-/'`
+
+	                # modify for pppoe
+	                [ $PPP_ENABLE = "YES" ] && [ $OUT = $PPP_DEV ] && OUT=$PPP_IF
+
+			IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$IN"
+			if [ -s $IF_CONF ];then
+                       	IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                       	MASK=$(grep "NETMASK" $IF_CONF|awk -F= '{print $2}')
+
+                       	IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$OUT"
+			if [ -s $IF_CONF ];then
+			egrep "BOOTPROTO=dhcp|BOOTPROTO=dialup" $IF_CONF 2>&1 > /dev/null
+                       	if [ $? = 0 ];then
+                               	INT_IP=$(ifconfig |grep $OUT -A1|grep inet|awk '{print $2}'|awk -F: '{print $2}')
+                       	else
+                               	INT_IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                       	fi
+                       	$IPT -t nat -A POSTROUTING  -s $IP/$MASK -o $OUT -j SNAT --to $INT_IP
+			fi
+			fi
+		done
+		fi
+		[ -s $TMP ] && rm -rf $TMP
+	else
+		for i in $FORWARD_RULE;do
+			echo $i|grep -q "^[#]"
+			[ $? = 0 ] && continue
+
+                        STR_TIME=""
+                        TIME=`echo $i|awk -F"&" '{print $2}'`
+                        i=`echo $i|awk -F"&" '{print $1}'`
+			i=`echo $i|tr 'A-Z' 'a-z'`
+
+                        if [ ! -z "$TIME" ] ;then
+                                TM_START=`echo $TIME|awk -F"|" '{print $1}'`
+                                TM_END=`echo $TIME|awk -F"|" '{print $2}'`
+                                TM_DAYS=`echo $TIME|awk -F"|" '{print $3}'`
+	                        [ -z $TM_DAYS ] && TM_DAYS="Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+                                STR_TIME=" -m time --timestart $TM_START --timestop $TM_END --days $TM_DAYS"
+                        fi
+
+                	IN=`echo $i|awk -F"|" '{print $1}'`
+                	OUT=`echo $i|awk -F"|" '{print $2}'`
+
+	                # modify for pppoe
+                        [ $PPP_ENABLE = "YES" ] && [ $OUT = $PPP_DEV ] && OUT=$PPP_IF
+
+                	IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$IN"
+			if [ -s $IF_CONF ];then
+                	IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                	MASK=$(grep "NETMASK" $IF_CONF|awk -F= '{print $2}')
+			
+			IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$OUT"
+			if [ -s $IF_CONF ];then
+			egrep "BOOTPROTO=dhcp|BOOTPROTO=dialup" $IF_CONF 2>&1 > /dev/null
+			if [ $? = 0 ];then
+			        INT_IP=$(ifconfig |grep $OUT -A1|grep inet|awk '{print $2}'|awk -F: '{print $2}')
+			else
+			        INT_IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+			fi
+
+			if [ -z "$STR_TIME" ];then
+	                	$IPT -t nat -A POSTROUTING  -s $IP/$MASK -o $OUT -j SNAT --to $INT_IP
+			else
+	                	$IPT -t nat -A POSTROUTING  -s $IP/$MASK -o $OUT $STR_TIME -j SNAT --to $INT_IP
+			fi
+			fi
+			fi
+		done
+	fi	
+fi
+
+if [ $VPN_ENABLE = "OPENVPN" ];then
+################## configure for pppoe adsl rules
+        VIN=`echo $VPN_ROUTER|awk -F"|" '{print $1}'`
+        VIF_CONF="/etc/sysconfig/network-scripts/ifcfg-$VIN"
+
+        # modify for pppoe
+        [ $PPP_ENABLE = "YES" ] && [ $VIN = $PPP_DEV ] && VIN=$PPP_IF
+
+	egrep "BOOTPROTO=dhcp|BOOTPROTO=dialup" $VIF_CONF 2>&1 > /dev/null
+        if [ $? = 0 ];then
+                VIP=$(ifconfig |grep $VIN -A1|grep inet|awk '{print $2}'|awk -F: '{print $2}')
+        else
+                VIP=$(grep "IPADDR" $VIF_CONF|awk -F= '{print $2}')
+        fi
+        sed -i "/^remote/s/^.*$/remote $VIP 1194/g" $VPN_CLIENT_CONF
+
+	$IPT -t nat -A POSTROUTING -o tun+ -j MASQUERADE
+fi 
+
+if [ ! -z "$VLAN" ];then
+        for i in $VLAN;do
+                OUT=`echo $i|awk -F"#" '{print $2}'`
+                i=`echo $i|awk -F"#" '{print $1}'`
+                IF=`echo $i|awk -F"|" '{print $1}'`
+                NET=`echo $i|awk -F"|" '{print $3}'`
+                MASK=`echo $i|awk -F"|" '{print $4}'`
+                GW=`echo $i|awk -F"|" '{print $5}'`
+
+                IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$OUT"
+                if [ -s $IF_CONF ];then
+                        egrep "BOOTPROTO=dhcp|BOOTPROTO=dialup" $IF_CONF 2>&1 > /dev/null
+                        if [ $? = 0 ];then
+                                INT_IP=$(ifconfig |grep $OUT -A1|grep inet|awk '{print $2}'|awk -F: '{print $2}')
+                        else
+                                INT_IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                        fi
+                fi
+
+                route add -net $NET netmask $MASK gw $GW
+                $IPT -t nat -A POSTROUTING  -s $NET/$MASK -o $OUT -j SNAT --to $INT_IP
+        done
+fi
+
+fi

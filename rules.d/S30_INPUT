@@ -1,0 +1,78 @@
+#!/bin/sh
+# init config file
+. /etc/firewall/config/config.inc
+
+LIST_LAN=""
+LIST_INT=""
+[ -z $PPP_IF ] && PPP_IF="ppp0"
+
+if [ ! -z "$LAN_IF" ];then
+	for i in $LAN_IF;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                i=`echo $i|tr 'A-Z' 'a-z'`
+		DEV=`echo $i|awk -F"|" '{print $1}'`
+		LIST_LAN="$LIST_LAN $DEV"
+	done
+fi
+if [ ! -z "$EXT_IF" ];then
+        for i in $EXT_IF;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                DEV=`echo $i|awk -F"|" '{print $1}'|sed "s/*//g"`
+		[ $PPP_ENABLE = "YES" ] && [ $DEV = $PPP_DEV ] && DEV=$PPP_IF
+                (echo "$i"|grep -q :) || LIST_INT="$LIST_INT $DEV"
+        done
+fi
+
+[ $VPN_ENABLE = "PPTP" ] && $IPT -A INPUT -p GRE -j ACCEPT
+
+$IPT -A INPUT -j wblist-chain
+
+for IF in $LIST_INT;do
+	$IPT -A INPUT -i $IF -j syn-flood
+done
+
+$IPT -A INPUT -j dst-addr-check
+$IPT -A INPUT -p ! ICMP -j tcp-stat-flags
+$IPT -A INPUT -p ! ICMP -j connect-track
+
+if [ $REDIRECT_ENABLE != "NO" ] && [ -s /var/run/squid.pid ];then
+    if [ ! -z "$REDIRECT_PORTS" ];then
+        for i in $REDIRECT_PORTS;do
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                PROT="TCP"
+                IN=`echo $i|awk -F"|" '{print $1}'|awk -F# '{print $1}'`
+                OUT=`echo $i|awk -F"|" '{print $1}'|awk -F# '{print $2}'`
+
+                # modify for pppoe
+                [ $PPP_ENABLE = "YES" ] && [ $OUT = $PPP_DEV ] && OUT=$PPP_IF
+
+                IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$IN"
+                IP=$(grep "IPADDR" $IF_CONF|awk -F= '{print $2}')
+                MASK=$(grep "NETMASK" $IF_CONF|awk -F= '{print $2}')
+
+
+                SPORT="80"
+                DPORT=$SQUID_PORT
+
+                $IPT -A INPUT -i $IN  -p $PROT --sport $UNPRIVPORTS -s $IP/$MASK  -d $IP --dport $DPORT -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+        done
+    fi
+fi
+
+for i in $LIST_LAN;do
+        $IPT -A INPUT -i $i -j EXT-input
+done
+
+for i in $LIST_INT;do
+        IF_CONF="/etc/sysconfig/network-scripts/ifcfg-$i"
+        if [ -s "$IF_CONF" ];then
+        $IPT -A INPUT -i $i -p ! TCP -j src-addr-check
+        $IPT -A INPUT -i $i -p TCP --syn -j src-addr-check
+        $IPT -A INPUT -i $i -j EXT-input
+        fi
+done
