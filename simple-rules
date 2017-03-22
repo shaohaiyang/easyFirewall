@@ -1,0 +1,146 @@
+#!/bin/sh
+IPT="/usr/local/iptables/sbin/iptables"
+SSH_PORT=`awk '/^Port/{print $2}' /etc/ssh/sshd_config`
+ADDR=`/sbin/ifconfig | sed -r -n 's@.*addr:(192.168.*)Bcast:.*Mask:.*@\1@gp'|sed -r -n 's@ @@gp'`
+DEV=`/sbin/ifconfig |grep -B1 192.168|awk '/HWaddr/{print $1}'`
+GATE=`awk -F=  'BEGIN{IGNORECASE=1} /GATEWAY/{print $2}' /etc/sysconfig/network-scripts/ifcfg-$DEV`
+
+[ -z $SSH_PORT ] && SSH_PORT="22"
+# white list include fudi/liuxi ip network
+WHITE_LISTS=""
+
+WHITE_PORTS="80"
+FORWARD_SERVICES=
+
+#21,80,443,21000:30000
+if [ $ADDR = "192.168.0.85" -o $ADDR = "192.168.0.86" ];then
+	WHITE_PORTS="80,443,19827,1998"
+	FORWARD_SERVICES="tcp|eth0#63306|3306#192.168.1.38#eth1"
+fi
+
+# lists_php_api_hgh 192.168.1.220 ~ 192.168.1.227 192.168.5.81 ~ 192.168.5.84
+if [[ $ADDR =~ "192.168.1.22" ]] || [[ $ADDR =~ "192.168.5.8" ]];then
+	WHITE_PORTS="80,443,19827,1998"
+	FORWARD_SERVICES=
+fi
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo 1 > /proc/sys/net/ipv4/conf/lo/arp_ignore
+echo 2 > /proc/sys/net/ipv4/conf/lo/arp_announce
+echo 1 > /proc/sys/net/ipv4/conf/all/arp_ignore
+echo 2 > /proc/sys/net/ipv4/conf/all/arp_announce
+echo 1 > /proc/sys/net/ipv4/conf/all/send_redirects
+echo 1 > /proc/sys/net/ipv4/conf/default/send_redirects
+
+[ ! -z $GATE ] && ip ro re 192.168.0.0/16 via $GATE dev $DEV
+
+start(){
+        $IPT -F
+	$IPT -X wblist-chain
+	$IPT -N wblist-chain
+	$IPT -X connect-track 
+	$IPT -N connect-track 
+	$IPT -X syn-flood
+	$IPT -N syn-flood
+	$IPT -X tcp-stat-flags
+	$IPT -N tcp-stat-flags
+	        
+	$IPT -A INPUT -j wblist-chain
+	$IPT -A INPUT -p tcp -m state --state NEW  -j syn-flood
+	$IPT -A INPUT ! -p icmp -j connect-track
+	
+	$IPT -A wblist-chain -p VRRP -j ACCEPT
+	$IPT -A wblist-chain -p ICMP -j ACCEPT
+	$IPT -A wblist-chain -p UDP -m multiport --ports 53,123,953 -j ACCEPT
+	#$IPT -A syn-flood -p tcp -m multiport --dports 80 -m limit --limit 151/sec --limit-burst 200 -j ACCEPT
+	$IPT -A connect-track -p udp -m state --state NEW -j ACCEPT
+	$IPT -A connect-track -p ICMP -j ACCEPT
+	$IPT -A connect-track -m state --state RELATED,ESTABLISHED -j ACCEPT
+        $IPT -A connect-track -p tcp -m multiport --dports $SSH_PORT,$WHITE_PORTS -j ACCEPT
+
+        NETWORK=`ifconfig |awk '/inet.*addr.*Mask/{split($2,a,":");print a[2]}'`
+        for addr in $NETWORK;do
+                if [[ $addr =~ "127.0.0.1" ]];then
+                        NET=$addr
+                elif [[ $addr =~ "192.168." ]];then
+                        NET=$addr/16
+                elif [[ $addr =~ "172." ]];then
+                        NET=$addr/16
+                else
+                        NET=$addr/24
+                fi
+                $IPT -A wblist-chain -s $NET -j ACCEPT
+        done
+
+	if [ ! -z "$WHITE_LISTS" ];then
+		for ip in $WHITE_LISTS;do
+                	echo $ip|grep -q "^[#]"
+	                [ $? = 0 ] && continue
+			$IPT -A wblist-chain -s $ip -j ACCEPT
+		done
+	fi
+
+	if [ ! -z "$ZZ_RULES" ];then
+		for ip in $ZZ_RULES;do
+                	echo $ip|grep -q "^[#]"
+	                [ $? = 0 ] && continue
+			$IPT -A connect-track -p tcp -s $ip -m multiport --dports 403,3130 -j ACCEPT
+		done
+	fi
+	$IPT -A connect-track -m state --state INVALID -j DROP
+	$IPT -A connect-track -j DROP
+
+        if [ ! -z "$FORWARD_SERVICES" ];then
+        for i in $FORWARD_SERVICES;do
+                echo $i|grep -q "^[#]"
+                [ $? = 0 ] && continue
+
+                STR_TIME=""
+                TIME=`echo $i|awk -F"&" '{print $2}'`
+
+                i=`echo $i|awk -F"&" '{print $1}'`
+                i=`echo $i|tr 'A-Z' 'a-z'`
+                PROT=`echo $i|awk -F"|" '{print $1}'`
+                IN=`echo $i|awk -F"|" '{print $2}'|awk -F# '{print $1}'`
+                IN_DEV=`echo "$IN"|sed 's/:.*//'`
+
+                OUT_DEV=`echo $i|awk -F"|" '{print $3}'|awk -F# '{print $3}'`
+                DPORT=`echo $i|awk -F"|" '{print $2}'|awk -F# '{print $2}'`
+                DADDR=`ifconfig $OUT_DEV|awk '/inet addr:192/{gsub("addr:","",$2);print $2}'`
+                SPORT=`echo $i|awk -F"|" '{print $3}'|awk -F# '{print $1}'`
+                SADDR=`echo $i|awk -F"|" '{print $3}'|awk -F# '{print $2}'`
+
+
+                $IPT -t nat -A PREROUTING -p $PROT -i $IN_DEV --dport $DPORT $STR_TIME -j DNAT --to $SADDR:$SPORT
+                $IPT -t nat -A POSTROUTING -p $PROT -o $OUT_DEV --dport $SPORT $STR_TIME -j SNAT --to $DADDR
+        done
+        fi
+}
+
+stop(){
+        $IPT -P INPUT ACCEPT
+        $IPT -F
+        $IPT -F -t nat
+        $IPT -F -t mangle
+        $IPT -X wblist-chain
+        $IPT -N wblist-chain
+        $IPT -X connect-track
+        $IPT -N connect-track
+        $IPT -X syn-flood
+        $IPT -N syn-flood
+        $IPT -X tcp-stat-flags
+        $IPT -N tcp-stat-flags
+}
+
+case $1 in
+        start)
+                start;;
+        stop)
+                stop;;
+	restart)
+		stop
+		start
+		;;
+        *)
+                echo "$0 start|stop|restart";;
+esac
